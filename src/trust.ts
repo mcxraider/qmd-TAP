@@ -3,25 +3,26 @@
  *
  * A project-local `.qmd/index.yml` arrives with a `git clone`, and
  * `findLocalConfigPath` adopts it automatically for any command run inside the
- * tree. Three fields in that file can reach outside the project:
+ * tree. These fields can reach outside the project:
  *
  * - `update:` — a shell command run by `qmd update` (#886)
  * - `collections.*.path` — any directory the process can read (#889)
  * - `models.embed` / `models.rerank` / `models.generate` — any `hf:` repo or
  *   local GGUF path (#889)
+ * - `models.provider` — a remote endpoint receiving the API key and indexed text
  *
  * Global `~/.config/qmd` is never gated. In-project collection paths and the
  * built-in default model URIs are also allowed without approval: those are
  * what a local config is for. Approvals are per config file and per gated
  * set, recorded in `<config dir>/trusted.json`. Editing a hook, pointing a
- * collection outside the project, or changing a custom model URI changes the
- * digest and re-arms the gate.
+ * collection outside the project, or changing a model or provider setting
+ * changes the digest and re-arms the gate.
  */
 
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { getConfigDir } from "./collections.js";
+import { getConfigDir, type ModelsConfig } from "./collections.js";
 import { qmdHomedir } from "./paths.js";
 
 /** A collection's pre-update hook, as it will be executed. */
@@ -47,12 +48,14 @@ export type SensitiveSnapshot = {
   hooks: UpdateHook[];
   paths: CollectionPath[];
   models: ModelsSnapshot;
+  provider?: ModelsConfig["provider"];
 };
 
 export type GatedItems = {
   hooks: UpdateHook[];
   paths: CollectionPath[];
   models: Array<{ slot: ModelSlot; uri: string }>;
+  provider?: ModelsConfig["provider"];
 };
 
 export type BuiltinModels = Required<ModelsSnapshot>;
@@ -155,11 +158,12 @@ export function gatedItems(
     hooks: snapshot.hooks,
     paths: snapshot.paths.filter(p => !isCollectionPathInsideProject(configPath, p.path)),
     models: gatedModels(snapshot.models, builtins),
+    provider: snapshot.provider,
   };
 }
 
 export function hasGatedItems(gated: GatedItems): boolean {
-  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0;
+  return gated.hooks.length > 0 || gated.paths.length > 0 || gated.models.length > 0 || gated.provider !== undefined;
 }
 
 function byFirst(a: string[], b: string[]): number {
@@ -184,7 +188,7 @@ export function hookDigest(hooks: UpdateHook[]): string {
 
 /**
  * Digest of the gated surface of a project-local config: hooks, resolved
- * collection paths, and non-default model URIs. Missing model keys and the
+ * collection paths, non-default model URIs, and remote provider settings. Missing model keys and the
  * built-in default URIs are equivalent so that `qmd init` filling defaults
  * into the YAML does not invalidate an approval.
  */
@@ -202,6 +206,12 @@ export function sensitiveDigest(
     models: gated.models
       .map(m => [m.slot, m.uri] as [string, string])
       .sort(byFirst),
+    provider: gated.provider ? {
+      base_url: gated.provider.base_url,
+      embed: gated.provider.embed ?? null,
+      generate: gated.provider.generate ?? null,
+      embed_dimensions: gated.provider.embed_dimensions ?? null,
+    } : null,
   });
   return createHash("sha256").update(canonical).digest("hex");
 }
@@ -304,7 +314,7 @@ export function decideHookGate(options: {
 
 /**
  * Decide whether a project-local config may use its gated fields (hooks,
- * out-of-project collection paths, non-default model URIs).
+ * out-of-project collection paths, non-default model URIs, remote providers).
  *
  * In-project paths and built-in default models do not need a decision.
  * Non-interactive callers get `skip`: in-project indexing still proceeds,

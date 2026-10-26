@@ -184,3 +184,34 @@ describe("qmd update with only in-project paths", () => {
     expect(result.exitCode).toBe(0);
   }, 120_000);
 });
+
+describe("qmd update with a checked-in remote provider", () => {
+  function providerConfig(baseUrl: string): string {
+    return [
+      "collections:",
+      "  docs:",
+      "    path: ./docs",
+      '    pattern: "**/*.md"',
+      "models:",
+      "  provider:",
+      `    base_url: ${JSON.stringify(baseUrl)}`,
+      "    embed: cohere.embed-v4:0",
+      "",
+    ].join("\n");
+  }
+
+  test("gates the provider with an API key present and re-arms after an endpoint change", async () => {
+    writeLocalConfig(providerConfig("https://one.example/models"));
+    const untrusted = await runQmd(["update"], { QMD_API_KEY: "test-secret" });
+    expect(untrusted.stdout).toContain("Remote provider:");
+    expect(untrusted.stdout).toContain("qmd trust");
+    expect(untrusted.stdout).toContain("Indexed: 1 new");
+
+    const approved = await runQmd(["trust"]);
+    expect(approved.stdout).toContain("https://one.example/models");
+    writeLocalConfig(providerConfig("https://two.example/models"));
+    const changed = await runQmd(["update"], { QMD_API_KEY: "test-secret" });
+    expect(changed.stdout).toContain("Remote provider:");
+    expect(changed.stdout).toContain("https://two.example/models");
+  }, 120_000);
+});

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Remote retrieval and Jev migration
+
+- Add remote embedding and query expansion/generation support across CLI, SDK, and MCP using `models.provider` and `QMD_API_KEY`. Defaults match the sibling qmd configuration: `text-embedding-3-small` (1536 dimensions) and `gpt-6-luna`. Append `/embeddings` and `/chat/completions` to the configured API base without inserting `/v1`.
+- Gate project-local provider settings through config trust, including automatically adopted MCP configs; preserve provider model identity in embedding fingerprints and caches.
+- Use TypeSafe Jev `jev-1.13.0` for query reranking with `TYPESAFE_API_KEY`, validated scores, bounded concurrency, and retrieval-ranking fallback on service failures. Explicit reranking opt-outs remain available; local reranker settings are ignored in these query paths.
+- Reduce the default reranking candidate pool from 40 to 20 while preserving explicit overrides.
+- Start structured-search vector embeddings before synchronous keyword search, and observe failures immediately while the work overlaps.
+
 ### Fixed
 
 - `qmd doctor` selects vector sample identities before loading document bodies,

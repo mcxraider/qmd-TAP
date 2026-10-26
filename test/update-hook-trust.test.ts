@@ -13,6 +13,8 @@ import {
   decideHookGate,
   decideLocalConfigGate,
   getTrustFilePath,
+  gatedItems,
+  hasGatedItems,
   hookDigest,
   isCollectionPathInsideProject,
   isLocalConfigPath,
@@ -251,6 +253,13 @@ describe("isCollectionPathInsideProject", () => {
 
 describe("sensitiveDigest", () => {
   const project = "/home/me/project/.qmd/index.yml";
+
+  test("gates a provider even with in-project paths and invalidates approval on changes", () => {
+    const initial = snapshot({ provider: { base_url: "https://one.example", embed: "embed-a" } });
+    const changed = snapshot({ provider: { base_url: "https://two.example", embed: "embed-a" } });
+    expect(hasGatedItems(gatedItems(project, initial, builtins))).toBe(true);
+    expect(sensitiveDigest(initial, project, builtins)).not.toBe(sensitiveDigest(changed, project, builtins));
+  });
 
   test("is stable across collection ordering", () => {
     const a = snapshot({

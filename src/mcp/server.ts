@@ -35,10 +35,42 @@ import {
   MetadataBindingBudgetError,
   MetadataOptionError,
 } from "../index.js";
-import { getConfigPath } from "../collections.js";
+import { getConfigPath, loadConfig } from "../collections.js";
+import { DEFAULT_EMBED_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_GENERATE_MODEL_URI } from "../llm.js";
+import { gatedItems, hasGatedItems, isLocalConfigPath, isLocalConfigTrustOptedIn, isTrusted, sensitiveDigest } from "../trust.js";
 import { formatMetadataKeySummaries } from "../metadata-format.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
+
+/** Strip gated fields from an automatically adopted, untrusted project config. */
+export function mcpConfigSource(configPath: string) {
+  if (!existsSync(configPath)) return {};
+  if (!isLocalConfigPath(configPath) || isLocalConfigTrustOptedIn()) return { configPath };
+  const config = loadConfig();
+  const builtins = {
+    embed: DEFAULT_EMBED_MODEL_URI,
+    rerank: DEFAULT_RERANK_MODEL_URI,
+    generate: DEFAULT_GENERATE_MODEL_URI,
+  };
+  const snapshot = {
+    hooks: Object.entries(config.collections ?? {}).filter(([, col]) => !!col.update)
+      .map(([collection, col]) => ({ collection, command: col.update! })),
+    paths: Object.entries(config.collections ?? {}).map(([collection, col]) => ({ collection, path: col.path })),
+    models: { embed: config.models?.embed, rerank: config.models?.rerank, generate: config.models?.generate },
+    provider: config.models?.provider,
+  };
+  const gated = gatedItems(configPath, snapshot, builtins);
+  if (!hasGatedItems(gated) || isTrusted(configPath, sensitiveDigest(snapshot, configPath, builtins))) return { configPath };
+  return {
+    config: {
+      ...config,
+      collections: Object.fromEntries(Object.entries(config.collections ?? {})
+        .filter(([name]) => !gated.paths.some(path => path.collection === name))
+        .map(([name, col]) => [name, { ...col, update: undefined }])),
+      models: { embed: builtins.embed, generate: builtins.generate },
+    },
+  };
+}
 
 // =============================================================================
 // Types for structured content
@@ -406,7 +438,7 @@ Intent-aware lex (C++ performance, not sports):
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
         candidateLimit: z.number().optional().describe(
-          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+          "Maximum candidates to rerank (default: 20, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
         filter: z.record(z.string(), z.unknown()).optional().describe(
@@ -1016,7 +1048,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
+    ...mcpConfigSource(configPath),
   });
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
@@ -1070,7 +1102,7 @@ export async function startMcpHttpServer(
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
+    ...mcpConfigSource(configPath),
   });
 
   // Pre-fetch default collection names for REST endpoint

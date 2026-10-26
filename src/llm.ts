@@ -91,6 +91,16 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
+// Embed-model names that take raw text (no in-text task prefix) because the
+// backend conveys task intent out-of-band — e.g. a remote API using an
+// `input_type` request field. Registered by RemoteLLM on construction.
+const rawTextEmbedModels = new Set<string>();
+
+/** Register an embed-model name whose inputs must not be prompt-prefixed. */
+export function registerRemoteEmbedModel(model: string): void {
+  rawTextEmbedModels.add(model);
+}
+
 /**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
@@ -98,6 +108,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (rawTextEmbedModels.has(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -111,6 +122,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (rawTextEmbedModels.has(uri)) return text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -271,6 +283,48 @@ export type RerankDocument = {
   text: string;
   title?: string;
 };
+
+/**
+ * Parse query-expansion model output into Queryable sub-queries.
+ *
+ * Expects lines of the form `lex: ...` / `vec: ...` / `hyde: ...`. Lines whose
+ * expanded text shares no token with the original query are dropped (degenerate
+ * terms that match nothing). Shared by the local (GBNF-constrained) and remote
+ * (chat-prompted) backends so both honour the same contract.
+ */
+export function parseExpansionLines(raw: string, query: string, includeLexical: boolean): Queryable[] {
+  const lines = raw.trim().split("\n");
+  const queryTerms = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  const hasQueryTerm = (text: string): boolean => {
+    if (queryTerms.length === 0) return true;
+    const lower = text.toLowerCase();
+    return queryTerms.some(term => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines.map(line => {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) return null;
+    const type = line.slice(0, colonIdx).trim();
+    if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+    const text = line.slice(colonIdx + 1).trim();
+    if (!text || !hasQueryTerm(text)) return null;
+    return { type: type as QueryType, text };
+  }).filter((q): q is Queryable => q !== null);
+
+  return includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+}
+
+/**
+ * Default fallback sub-queries when expansion yields nothing usable.
+ */
+export function expansionFallback(query: string, includeLexical: boolean): Queryable[] {
+  const fallback: Queryable[] = [
+    { type: 'hyde', text: `Information about ${query}` },
+    { type: 'lex', text: query },
+    { type: 'vec', text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+}
 
 // =============================================================================
 // Model Configuration
@@ -594,6 +648,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embed multiple texts (order-preserving; nulls for failures)
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -619,6 +678,15 @@ export interface LLM {
    * Dispose of resources
    */
   dispose(): Promise<void>;
+
+  /** Resolved model names (used for cache keys and fingerprints). */
+  readonly embedModelName: string;
+  readonly generateModelName: string;
+  readonly rerankModelName: string;
+
+  /** Tokenize/detokenize for token-boundary chunking. */
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
 }
 
 // =============================================================================
@@ -1683,36 +1751,9 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+      const filtered = parseExpansionLines(result, query, includeLexical);
       if (filtered.length > 0) return filtered;
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      return expansionFallback(query, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
@@ -1926,11 +1967,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1966,7 +2007,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): LLM {
     return this.llm;
   }
 }
@@ -2139,7 +2180,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {

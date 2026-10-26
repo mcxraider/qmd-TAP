@@ -71,25 +71,28 @@ describe("local .qmd project config", () => {
 
     const home = join(root, "home");
     const { bin, args } = cliCommandArgs("status");
+    const { args: trustArgs } = cliCommandArgs("trust");
+    const env = {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: join(home, ".config"),
+      XDG_CACHE_HOME: join(home, ".cache"),
+      QMD_EMBED_MODEL: "env-embed-model",
+      QMD_RERANK_MODEL: "env-rerank-model",
+      QMD_GENERATE_MODEL: "env-generate-model",
+    };
+    execFileSync(bin, trustArgs, { cwd: root, encoding: "utf-8", env });
     const output = execFileSync(bin, args, {
       cwd: root,
       encoding: "utf-8",
-      env: {
-        ...process.env,
-        HOME: home,
-        XDG_CONFIG_HOME: join(home, ".config"),
-        XDG_CACHE_HOME: join(home, ".cache"),
-        QMD_EMBED_MODEL: "env-embed-model",
-        QMD_RERANK_MODEL: "env-rerank-model",
-        QMD_GENERATE_MODEL: "env-generate-model",
-      },
+      env,
     });
 
     const localIndex = join(root, ".qmd", "index.sqlite");
     expect(output).toContain(`Index: ${realpathSync(localIndex)}`);
     expect(output).toContain("docs (qmd://docs/)");
     expect(output).toContain("Embedding:   local-embed-model");
-    expect(output).toContain("Reranking:   local-rerank-model");
+    expect(output).toContain("Reranking:   typesafe:jev-");
     expect(output).toContain("Generation:  local-generate-model");
     expect(output).not.toContain("env-embed-model");
     expect(existsSync(localIndex)).toBe(true);

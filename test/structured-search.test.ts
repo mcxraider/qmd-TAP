@@ -322,6 +322,104 @@ describe("structuredSearch", () => {
     // vec and hyde require embeddings, so just test lex
   });
 
+  test("starts vector embedding before synchronous lexical search", async () => {
+    store.ensureVecTable(3);
+    const events: string[] = [];
+    const originalLlm = store.llm;
+    const originalSearchFTS = store.searchFTS;
+    const originalSearchVec = store.searchVec;
+    let releaseEmbedding: () => void = () => {};
+    const embeddingGate = new Promise<void>(resolve => { releaseEmbedding = resolve; });
+    store.llm = {
+      embedModelName: "test-embed-model",
+      embedBatch: async () => {
+        await Promise.resolve();
+        events.push("embedding started");
+        await embeddingGate;
+        return [{ embedding: [1, 0, 0], model: "test-embed-model" }];
+      },
+    } as any;
+    store.searchFTS = ((...args: Parameters<typeof originalSearchFTS>) => {
+      events.push("lexical search");
+      releaseEmbedding();
+      return originalSearchFTS(...args);
+    }) as typeof originalSearchFTS;
+    store.searchVec = vi.fn(async () => []);
+
+    try {
+      await structuredSearch(store, [
+        { type: "lex", query: "test" },
+        { type: "vec", query: "test semantic" },
+      ], { skipRerank: true });
+      expect(events).toEqual(["embedding started", "lexical search"]);
+    } finally {
+      store.llm = originalLlm;
+      store.searchFTS = originalSearchFTS;
+      store.searchVec = originalSearchVec;
+    }
+  });
+
+  test("propagates embedding failure without an unhandled rejection", async () => {
+    store.ensureVecTable(3);
+    const previous = store.llm;
+    store.llm = Object.assign(new (await import("../src/llm.js")).LlamaCpp(), {
+      embedBatch: async () => { throw new Error("embedding unavailable"); },
+    });
+    try {
+      await expect(structuredSearch(store, [
+        { type: "lex", query: "test" }, { type: "vec", query: "semantic test" },
+      ], { skipRerank: true })).rejects.toThrow("embedding unavailable");
+      const fts = vi.spyOn(store, "searchFTS").mockImplementationOnce(() => { throw new Error("lexical unavailable"); });
+      try {
+        await expect(structuredSearch(store, [
+          { type: "lex", query: "test" }, { type: "vec", query: "semantic test" },
+        ], { skipRerank: true })).rejects.toThrow("lexical unavailable");
+      } finally { fts.mockRestore(); }
+    } finally { store.llm = previous; }
+  });
+
+  test("uses 20 reranking candidates by default and honors an override", async () => {
+    const now = new Date().toISOString();
+    for (const term of ["candidatealpha", "candidatebeta"]) {
+      for (let i = 0; i < 15; i++) {
+        const body = `${term} evidence ${i}`;
+        const hash = await hashContent(body);
+        insertContent(store.db, hash, body, now);
+        insertDocument(store.db, "candidates", `${term}-${i}.md`, `${term} ${i}`, hash, now, now);
+      }
+    }
+    const rerank = vi.spyOn(store, "rerank").mockImplementation(async (_query, docs) => docs.map(doc => ({ file: doc.file, score: 0.5 })));
+    const searches: ExpandedQuery[] = [
+      { type: "lex", query: "candidatealpha" }, { type: "lex", query: "candidatebeta" },
+    ];
+    try {
+      await structuredSearch(store, searches);
+      expect(rerank.mock.calls[0]?.[1]).toHaveLength(20);
+      await structuredSearch(store, searches, { candidateLimit: 25 });
+      expect(rerank.mock.calls[1]?.[1]).toHaveLength(25);
+    } finally { rerank.mockRestore(); }
+  });
+
+  test("falls back on a reranking outage but propagates missing credentials", async () => {
+    const now = new Date().toISOString();
+    const body = "outagetest evidence";
+    const hash = await hashContent(body);
+    insertContent(store.db, hash, body, now);
+    insertDocument(store.db, "outage", "outage.md", "Outage", hash, now, now);
+    const searches: ExpandedQuery[] = [{ type: "lex", query: "outagetest" }];
+    const expected = await structuredSearch(store, searches, { skipRerank: true });
+    const rerank = vi.spyOn(store, "rerank").mockRejectedValue(new Error("service unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const fallback = await structuredSearch(store, searches);
+      expect(fallback.map(r => r.file)).toEqual(expected.map(r => r.file));
+      expect(fallback.every(r => Number.isFinite(r.score))).toBe(true);
+      const { MissingTypeSafeKeyError } = await import("../src/llm-typesafe.js");
+      rerank.mockRejectedValueOnce(new MissingTypeSafeKeyError());
+      await expect(structuredSearch(store, searches)).rejects.toThrow("TYPESAFE_API_KEY");
+    } finally { rerank.mockRestore(); warn.mockRestore(); }
+  });
+
   test("respects limit option", async () => {
     const results = await structuredSearch(store, [
       { type: "lex", query: "test" }

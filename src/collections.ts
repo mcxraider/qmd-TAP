@@ -38,8 +38,21 @@ export interface Collection {
  */
 export interface ModelsConfig {
   embed?: string;
+  /** Legacy local reranker URI; ignored while TypeSafe Jev handles reranking. */
   rerank?: string;
   generate?: string;
+  /**
+   * Route embeddings and query-expansion/generation through a remote
+   * OpenAI-compatible API instead of on-device models. Reranking uses TypeSafe Jev.
+   * The provider API key is read from the QMD_API_KEY env var,
+   * never from this file.
+   */
+  provider?: {
+    base_url: string;            // e.g. https://api.ai.tech.gov.sg/platform/models
+    embed?: string;              // remote embedding model (default: "text-embedding-3-small")
+    generate?: string;           // remote chat model (default: "gpt-6-luna")
+    embed_dimensions?: number;   // output_dimension for the embeddings request (default: 1536)
+  };
 }
 
 /**

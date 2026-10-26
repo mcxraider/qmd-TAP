@@ -948,6 +948,32 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("Collection");
   });
 
+  test("status reports the active remote embedding model", async () => {
+    const env = await createIsolatedTestEnv("remote-status");
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  provider:\n    base_url: https://example.invalid/models\n    embed: text-embedding-3-small\n    generate: remote-generation\n`);
+    const { stdout, exitCode } = await runQmd(["status"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_API_KEY: "test-key" },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Embedding:   text-embedding-3-small");
+    expect(stdout).toContain("Generation:  remote-generation");
+  });
+
+  test("a configured remote provider fails clearly when its API key is missing", async () => {
+    const env = await createIsolatedTestEnv("remote-missing-key");
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  provider:\n    base_url: https://example.invalid/models\n    embed: text-embedding-3-small\n`);
+    const { stdout, stderr, exitCode } = await runQmd(["status"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: { QMD_API_KEY: "" },
+    });
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("QMD_API_KEY is not set");
+    expect(stdout).not.toContain("embeddinggemma");
+  });
+
   test("status omits device probing details; doctor owns GPU diagnostics", async () => {
     const { stdout, exitCode } = await runQmd(["status"]);
     expect(exitCode).toBe(0);

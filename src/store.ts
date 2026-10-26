@@ -53,6 +53,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
+import { MissingTypeSafeKeyError } from "./llm-typesafe.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -62,6 +63,7 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -187,7 +189,7 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
+function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
 }
 
@@ -478,8 +480,7 @@ export function chunkDocumentWithBreakPoints(
 export const STRONG_SIGNAL_MIN_SCORE = 0.85;
 export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
-// 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
-export const RERANK_CANDIDATE_LIMIT = 40;
+export const RERANK_CANDIDATE_LIMIT = 20;
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
@@ -1585,8 +1586,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM backend for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -3838,7 +3839,7 @@ function stripUnpairedSurrogates(text: string): string {
  * for supported code files.
  */
 async function chunkDocumentByTokensWithLlm(
-  llm: LlamaCpp,
+  llm: LLM,
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
@@ -4973,7 +4974,7 @@ function nearestVecDocuments(
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
@@ -5044,7 +5045,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -5261,7 +5262,7 @@ function uniqueExpansions(expansions: ExpandedQuery[]): ExpandedQuery[] {
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
   // feeding caller intent to the expansion model contaminates sub-queries
@@ -5316,7 +5317,7 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
@@ -6354,7 +6355,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -6492,7 +6493,11 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent).catch(error => {
+    if (error instanceof MissingTypeSafeKeyError) throw error;
+    console.warn("TypeSafe reranking unavailable; using retrieval ranking:", error instanceof Error ? error.message : String(error));
+    return chunksToRerank.map(doc => ({ file: doc.file, score: NaN }));
+  });
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6509,7 +6514,7 @@ export async function hybridQuery(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = Number.isNaN(r.score) ? rrfScore : rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6529,7 +6534,7 @@ export async function hybridQuery(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore: Number.isNaN(r.score) ? 0 : r.score,
       blendedScore,
     } : undefined;
 
@@ -6725,7 +6730,26 @@ export async function structuredSearch(
   // (undefined = all). searchFTS/searchVec merge per-collection results by score,
   // so the RRF weight below boosts the first search, not the first collection.
 
-  // Step 1: Run FTS for all lex searches (sync, instant)
+  // Start embedding before synchronous FTS; yield once so native embedding can run alongside it.
+  const vecSearches = hasVectors ? searches.filter(
+    (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
+      s.type === 'vec' || s.type === 'hyde'
+  ) : [];
+  const llm = vecSearches.length > 0 ? getLlm(store) : undefined;
+  const embedModel = llm?.embedModelName ?? "";
+  const embedStart = Date.now();
+  const embeddingsPromise = llm ? (() => {
+    const texts = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
+    hooks?.onEmbedStart?.(texts.length);
+    return llm.embedBatch(texts, { isQuery: true });
+  })() : undefined;
+  // Observe failures immediately, including when lexical search throws before the join.
+  void embeddingsPromise?.catch(() => {});
+  if (embeddingsPromise && searches.some(s => s.type === 'lex')) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+
+  // Step 1: Run FTS for all lex searches while vector embeddings are in flight.
   for (const search of searches) {
     if (search.type === 'lex') {
       const ftsResults = store.searchFTS(search.query, 20, collections, filter);
@@ -6744,41 +6768,30 @@ export async function structuredSearch(
     }
   }
 
-  // Step 2: Batch embed and run vector searches for vec/hyde
-  if (hasVectors) {
-    const vecSearches = searches.filter(
-      (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
-        s.type === 'vec' || s.type === 'hyde'
-    );
-    if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
-      hooks?.onEmbedStart?.(textsToEmbed.length);
-      const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
-      hooks?.onEmbedDone?.(Date.now() - embedStart);
+  // Step 2: Join embeddings and run vector searches for vec/hyde.
+  if (embeddingsPromise) {
+    const embeddings = await embeddingsPromise;
+    hooks?.onEmbedDone?.(Date.now() - embedStart);
 
-      for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
-        if (!embedding) continue;
+    for (let i = 0; i < vecSearches.length; i++) {
+      const embedding = embeddings[i]?.embedding;
+      if (!embedding) continue;
 
-        const vecResults = await store.searchVec(
-          vecSearches[i]!.query, embedModel, 20, collections,
-          undefined, embedding, filter
-        );
-        if (vecResults.length > 0) {
-          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(vecResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
-          rankedListMeta.push({
-            source: "vec",
-            queryType: vecSearches[i]!.type,
-            query: vecSearches[i]!.query,
-          });
-        }
+      const vecResults = await store.searchVec(
+        vecSearches[i]!.query, embedModel, 20, collections,
+        undefined, embedding, filter
+      );
+      if (vecResults.length > 0) {
+        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(vecResults.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
+        rankedListMeta.push({
+          source: "vec",
+          queryType: vecSearches[i]!.type,
+          query: vecSearches[i]!.query,
+        });
       }
     }
   }
@@ -6887,7 +6900,11 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent).catch(error => {
+    if (error instanceof MissingTypeSafeKeyError) throw error;
+    console.warn("TypeSafe reranking unavailable; using retrieval ranking:", error instanceof Error ? error.message : String(error));
+    return chunksToRerank.map(doc => ({ file: doc.file, score: NaN }));
+  });
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6903,7 +6920,7 @@ export async function structuredSearch(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = Number.isNaN(r.score) ? rrfScore : rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6923,7 +6940,7 @@ export async function structuredSearch(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore: Number.isNaN(r.score) ? 0 : r.score,
       blendedScore,
     } : undefined;
 

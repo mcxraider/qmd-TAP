@@ -108,6 +108,8 @@ import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM } from "../llm-remote.js";
+import { TypeSafeLLM, TYPESAFE_RERANK_MODEL } from "../llm-typesafe.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -179,16 +181,41 @@ function getStore(): ReturnType<typeof createStore> {
       syncConfigToDb(store.db, config);
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
+      const trusted = localConfigIsFullyTrusted();
+      const modelsForLlm = trusted ? activeModels : resolveModels();
+      const localLlm = new LlamaCpp({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
       });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // The local instance stays the global default: it provides the tokenizer
+      // (chunking) and device probing (doctor) regardless of backend.
+      setDefaultLlamaCpp(localLlm);
+
+      // Route embeddings + query expansion through the configured provider;
+      // TypeSafe handles reranking in either case.
+      const provider = trusted ? config.models?.provider : undefined;
+      if (provider?.base_url) {
+        const apiKey = process.env.QMD_API_KEY;
+        if (!apiKey) {
+          throw new Error("models.provider is configured but QMD_API_KEY is not set");
+        }
+        store.llm = new TypeSafeLLM(new RemoteLLM({
+          baseURL: provider.base_url,
+          apiKey,
+          embedModel: provider.embed ?? "text-embedding-3-small",
+          generateModel: provider.generate ?? "gpt-6-luna",
+          dimensions: provider.embed_dimensions ?? 1536,
+          localTokenizer: localLlm,
+        }));
+      } else {
+        store.llm = new TypeSafeLLM(localLlm);
+      }
+    } catch (error) {
+      // Missing config is optional, but a configured remote backend must never
+      // silently fall back to local embeddings when its credential is absent.
+      if (error instanceof Error && error.message === "models.provider is configured but QMD_API_KEY is not set") {
+        throw error;
+      }
     }
   }
   return store;
@@ -687,10 +714,11 @@ async function showStatus(): Promise<void> {
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
     const activeModels = resolveModelsForCli();
+    const activeLlm = store?.llm;
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    console.log(`  Embedding:   ${hfLink(activeLlm?.embedModelName ?? activeModels.embed)}`);
+    console.log(`  Reranking:   ${activeLlm?.rerankModelName ?? TYPESAFE_RERANK_MODEL}`);
+    console.log(`  Generation:  ${hfLink(activeLlm?.generateModelName ?? activeModels.generate)}`);
   }
 
 
@@ -760,6 +788,7 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       rerank: config.models?.rerank,
       generate: config.models?.generate,
     },
+    provider: config.models?.provider,
   };
 }
 
@@ -819,6 +848,11 @@ function printGatedItems(gated: GatedItems): void {
     for (const item of gated.models) {
       console.log(`  ${c.bold}${item.slot}${c.reset}: ${item.uri}`);
     }
+  }
+  if (gated.provider) {
+    const provider = gated.provider;
+    console.log(`${c.yellow}Remote provider:${c.reset}`);
+    console.log(`  ${provider.base_url} (embed: ${provider.embed ?? "text-embedding-3-small"}, generate: ${provider.generate ?? "gpt-6-luna"}, dimensions: ${provider.embed_dimensions ?? 1536})`);
   }
 }
 
@@ -2363,8 +2397,23 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   }
 }
 
-export function resolveEmbedModelForCli(): string {
+/**
+ * The embed-model name the active store will actually embed/query with.
+ * When a remote provider is configured, the store's backend is a RemoteLLM
+ * whose `embedModelName` is the provider model (e.g. text-embedding-3-small) — the
+ * embed and query paths must agree on this string or fingerprints won't match.
+ * Falls back to the configured local embed model when no store/provider.
+ */
+function activeEmbedModel(): string {
+  try {
+    const name = store?.llm?.embedModelName;
+    if (name) return name;
+  } catch { /* store not ready — fall through */ }
   return ensureModelsConfiguredForCli().embed;
+}
+
+export function resolveEmbedModelForCli(): string {
+  return activeEmbedModel();
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -2372,7 +2421,7 @@ export function resolveGenerateModelForCli(): string {
 }
 
 export function resolveRerankModelForCli(): string {
-  return ensureModelsConfiguredForCli().rerank;
+  return TYPESAFE_RERANK_MODEL;
 }
 
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
@@ -2388,12 +2437,15 @@ function resolveModelsForRuntime(): { embed: string; generate: string; rerank: s
 }
 
 async function vectorIndex(
-  model: string = resolveEmbedModelForCli(),
+  model?: string,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  // Resolve AFTER getStore() so a configured remote provider's embed model
+  // (e.g. text-embedding-3-small) is used — matching the query path's fingerprint.
+  model = model ?? activeEmbedModel();
 
   // Exclusive process lock — concurrent embeds race on vector_rows (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
@@ -2544,7 +2596,7 @@ type OutputOptions = {
   lineNumbers?: boolean; // Add line numbers to output
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
-  candidateLimit?: number;  // Max candidates to rerank (default: 40)
+  candidateLimit?: number;  // Max candidates to rerank (default: 20)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
@@ -3962,7 +4014,7 @@ function showHelp(): void {
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
-  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
+  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 20, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
@@ -4112,7 +4164,6 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID files");
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
-  addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
   add("QMD_FORCE_CPU", "forces llama.cpp to bypass GPU backends; embeddings/query will be slower but GPU crashes are avoided");
   add("QMD_LLAMA_GPU", "selects llama.cpp GPU backend (metal/cuda/vulkan) or disables GPU when set to false/off/0");
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
@@ -4175,7 +4226,6 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
   const checks = [
     { role: "embedding", key: "embed", active: activeModels.embed, configured: configModels.embed, defaultModel: DEFAULT_EMBED_MODEL, envName: "QMD_EMBED_MODEL", envValue: process.env.QMD_EMBED_MODEL },
     { role: "generation", key: "generate", active: activeModels.generate, configured: configModels.generate, defaultModel: DEFAULT_QUERY_MODEL, envName: "QMD_GENERATE_MODEL", envValue: process.env.QMD_GENERATE_MODEL },
-    { role: "reranking", key: "rerank", active: activeModels.rerank, configured: configModels.rerank, defaultModel: DEFAULT_RERANK_MODEL, envName: "QMD_RERANK_MODEL", envValue: process.env.QMD_RERANK_MODEL },
   ] as const;
 
   const notes: string[] = [];
@@ -4202,7 +4252,6 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   const models = [
     ["embedding", activeModels.embed],
     ["generation", activeModels.generate],
-    ["reranking", activeModels.rerank],
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
@@ -4238,7 +4287,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   if (invalid.length > 0) {
     nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
   } else {
-    nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
+    nextSteps.push("Run `qmd pull` to download missing embedding/generation models before `qmd embed` or `qmd query`.");
   }
 }
 
@@ -4472,7 +4521,22 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
+
+  const provider = configModels.provider;
+  if (provider?.base_url) {
+    const keyPresent = !!process.env.QMD_API_KEY;
+    doctorCheck(
+      "remote provider",
+      keyPresent,
+      `${provider.base_url} — embed: ${provider.embed ?? "text-embedding-3-small"} @ ${provider.embed_dimensions ?? 1536}d, ` +
+        `generate: ${provider.generate ?? "gpt-6-luna"}; ` +
+        `QMD_API_KEY ${keyPresent ? "present" : "MISSING (set it to use the API)"}; rerank uses TypeSafe Jev`,
+    );
+    if (!keyPresent) nextSteps.push("Set QMD_API_KEY to authenticate with the configured models.provider.");
+  } else {
+    checkModelCache(activeModels, nextSteps);
+  }
+  doctorCheck("TypeSafe key", !!process.env.TYPESAFE_API_KEY, process.env.TYPESAFE_API_KEY ? "present" : "MISSING (set TYPESAFE_API_KEY for reranking)");
 
   await runDoctorDeviceChecks(nextSteps);
 
@@ -4971,7 +5035,7 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
+        await vectorIndex(undefined, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -4987,11 +5051,15 @@ if (isMain) {
       await resolveLocalConfigTrust();
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const activeModels = resolveModelsForRuntime();
-      const models = [
-        activeModels.embed,
-        activeModels.generate,
-        activeModels.rerank,
-      ];
+      // Jev runs over the TypeSafe API and has no local model to pull.
+      const providerActive = !!loadConfig().models?.provider?.base_url && localConfigIsFullyTrusted();
+      const models = providerActive
+        ? []
+        : [activeModels.embed, activeModels.generate];
+      if (models.length === 0) {
+        console.log("Embedding and generation use the remote provider; Jev needs no local download.");
+        break;
+      }
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,
